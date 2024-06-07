@@ -1,0 +1,4 @@
+name: ldcast
+channels:
+  - defaults
+prefix: /home/mmhk20/.conda/envs/ldcast
