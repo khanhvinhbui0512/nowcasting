@@ -1,0 +1,176 @@
+import argparse
+import matplotlib.pyplot as plt
+from model import *
+#from metric import *
+from datamodule import *
+print("GPU is Available: ", torch.cuda.is_available())
+print("Number of GPUS: ",torch.cuda.device_count())
+parser = argparse.ArgumentParser()
+parser.add_argument('--usegpu',type=int,default=4)
+parser.add_argument('--batchsize',type=int,default=4)
+args = parser.parse_args()
+#Set up batch_size
+batch_size = args.batchsize
+init_lr = 1e-1
+use_GPU = args.usegpu
+def load_file(path):
+    pred_radar_dir = path+ "predict_radar/"
+    pred_satellite_dir = path + r"predict_24_2/"
+    GT_radar_dir = path + r"GT_radar/"
+    GT_satellite_dir= path + r"GT_24_2/"
+    list_dir = []
+    for name in os.listdir(pred_radar_dir):
+        temp = []
+        temp.append(pred_radar_dir+name)
+        pred_satellite_path = pred_satellite_dir + name[0:-6] + name[-4:]
+        GT_radar_path = GT_radar_dir + name
+        GT_satellite_path = GT_satellite_dir + name[0:-6] + name[-4:]
+        if(os.path.isfile(pred_satellite_path)):
+            temp.append(pred_satellite_path)
+        if(os.path.isfile(GT_radar_path)):
+            temp.append(GT_radar_path)
+        if(os.path.isfile(GT_satellite_path)):
+            temp.append(GT_satellite_path)
+        if(len(temp) == 4):
+            list_dir.append(temp)
+    return list_dir
+def data_loader(list_dir, isShuffle:bool):
+    transform_radar = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+    transform_satellite = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.CenterCrop(20),
+    ])
+    dataset = CustomDataset(list_img_dir=list_dir, transform_radar=transform_radar,transform_satellite = transform_satellite)
+    data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=isShuffle)
+    return data_loader
+def val(net,val_loader):
+    val_loss_radar_avg, val_loss_satellite_avg, num_batches = 0,0, 0
+    for i, data in enumerate(val_loader, 0):
+        with torch.no_grad():
+            inp_radar,inp_satellite,out_radar,out_satellite = data
+            inp_radar,inp_satellite = inp_radar.to(device),inp_satellite.to(device)
+            out_radar,out_satellite = out_radar.to(device),out_satellite.to(device)
+            pred_radar,pred_satellite = net(inp_radar,inp_satellite)
+            loss_radar = F.mse_loss(pred_radar,out_radar)
+            loss_satellite = F.mse_loss(pred_satellite,out_satellite)
+            val_loss_radar_avg += loss_radar.item()
+            val_loss_satellite_avg += loss_satellite.item()
+            num_batches += 1
+    val_loss_radar_avg /= num_batches
+    val_loss_satellite_avg /= num_batches
+    print('Validation loss radar: %f' % ( val_loss_radar_avg))
+    print('Validation loss satellite: %f' % ( val_loss_satellite_avg))
+
+def train(net,train_loader,optimizer, criterion,val_loader=None):
+    #Set up hyperparammeter
+    epochs = 15
+    warm_epoch = 5
+    learning_rate = 1e-3
+    last_lr = 1e-5
+    T_max = epochs
+    T_cur = 0
+    lr_list = [0]
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = f"cuda:{use_GPU}"
+        #if torch.cuda.device_count() > 1:
+        #     net = nn.DataParallel(net)
+    print(device)
+    net.to(device)
+    print('Start Training!!!!')
+    for epoch in range(1, epochs+1):  # loop over the dataset multiple times
+        running_loss = 0.0
+        epoch_steps = 0
+        T_cur += 1
+        # warm-up
+        if epoch <= warm_epoch:
+            optimizer.param_groups[0]['lr'] = (1.0 * epoch) / warm_epoch  * init_lr
+        else:
+            # cosine annealing lr
+            optimizer.param_groups[0]['lr'] = last_lr + (init_lr - last_lr) * (1 + np.cos(T_cur * np.pi / T_max)) / 2
+
+        for i, data in enumerate(train_loader, 0):
+            # get the inputs; data is a list of [inputs, labels]
+            inp_radar,inp_satellite,out_radar,out_satellite = data
+            inp_radar,inp_satellite = inp_radar.to(device),inp_satellite.to(device)
+            out_radar,out_satellite = out_radar.to(device),out_satellite.to(device)
+            # zero the parameter gradients
+            optimizer.zero_grad()
+            # forward + backward + optimize
+            pred_radar,pred_satellite = net(inp_radar,inp_satellite)
+            loss = criterion(pred_radar, out_radar)
+            loss.backward()
+            loss = criterion(pred_satellite, inp_satellite)
+            loss.backward()
+            optimizer.step()
+            # print statistics
+            running_loss += loss.item()
+            epoch_steps += 1
+            if i + 1 == len(train_loader):
+                print("Train loss radar and satellite: %.7f" % (epoch, running_loss / epoch_steps))
+                print("Curren Learning Rate: %.7f" % (epoch,lr_list[-1]))
+                running_loss = 0.0
+        lr_list.append(optimizer.param_groups[0]['lr'])
+        if(val_loader != None): val(net,val_loader)
+    print("Finished Training")
+
+def save_weight(net):
+    checkpoint = "checkpoint/"
+    os.makedirs(checkpoint, exist_ok=True)
+    i = 0
+    while(os.path.exists(checkpoint +f"model_weights_{i}.pth")):
+        i+=1
+    path = checkpoint + f"model_weights_{i}.pth"
+    torch.save(net.state_dict(),path)
+def test(net,test_loader):
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = f"cuda:{use_GPU}"
+        # if torch.cuda.device_count() > 1:
+        #     net = nn.DataParallel(net)
+    net.to(device)
+    net.eval()
+    #denormarlize = transforms.normalize(0,1/std)
+    #denormarlize = transforms.normalize(-1/std,std)
+    metric = ['mse','rmse']
+    loss = {}
+    for k in metric: loss[k] = 0
+    for i, data in enumerate(test_loader, 0):
+        with torch.no_grad():
+            inp_radar,inp_satellite,out_radar,out_satellite = data
+            inp_radar,inp_satellite = inp_radar.to(device),inp_satellite.to(device)
+            out_radar,out_satellite = out_radar.to(device),out_satellite.to(device)
+            pred_radar,pred_satellite = net(inp_radar,inp_satellite)
+            denormarlizae()
+            for m in metric:
+                loss[m]['radar'] += m(pred_radar,out_radar)
+                loss[m]['satellite'] += m(pred_satellite,out_satellite)
+            #loss_radar = F.mse_loss(pred_radar,out_radar)
+            #loss_satellite = F.mse_loss(pred_satellite,out_satellite)
+            #test_loss_radar_avg += loss_radar.item()
+            #test_loss_satellite_avg += loss_satellite.item()
+            num_batches += 1
+    for m in metric:
+        test_loss_radar = loss[m]/num_batches
+        test_loss_satellite = loss[m]/num_batches
+        print(f'{m} loss radar: %f' % ( test_loss_radar_avg))
+        print(f'{m} loss satellite: %f' % ( test_loss_satellite_avg))
+def main():
+    path_train = "/data/data_WF/finetune/train/"
+    #path_val = "/home/mmhk20/weather_forecast/finetune/data/val/"
+    #path_test = "/home/mmhk20/weather_forecast/finetune/data/test/"
+    train_list_dir = load_file(path = path_train)
+    print('Number of train sample: %d' % (len(train_list_dir)))
+    #test_list_dir = load_file(path = path_test)
+    train_loader = data_loader(list_dir=train_list_dir,isShuffle=True)
+    #test_loader = data_loader(list_dir=test_list_dir,isShuffle=True)
+    net = Unet()
+    criterion = nn.MSELoss()
+    optimizer = optim.SGD(net.parameters(), lr=init_lr, momentum=0.9)
+    train(net=net,train_loader=train_loader,optimizer=optimizer,criterion=criterion)
+    save_weight(net=net)
+    #test(net=net,test_loader=test_loader)
+if __name__ == "__main__":
+    main()
